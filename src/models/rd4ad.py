@@ -174,6 +174,7 @@ class RD4AD:
         self.ocbe.train()
         self.student.train()
         best_loss, patience_ctr = float("inf"), 0
+        best_state = None  # เก็บ state_dict ของ epoch ที่ loss ต่ำสุด (ใน RAM ระหว่างเทรน)
         w1, w2, w3 = self.cfg.LAYER_LOSS_WEIGHTS
 
         logger.info(f"RD4AD.fit(): เทรน OCBE+student {self.cfg.EPOCHS} epoch "
@@ -207,11 +208,34 @@ class RD4AD:
 
             if avg_loss < best_loss - 1e-5:
                 best_loss, patience_ctr = avg_loss, 0
+                # เก็บ state_dict ของ epoch ที่ดีที่สุดไว้ใน RAM — ก่อนหน้านี้
+                # early stopping นับ patience อย่างเดียวแต่ไม่เคย restore
+                # น้ำหนักที่ดีที่สุดจริง สุดท้ายใช้น้ำหนักของ epoch ที่ early-stop
+                # เสมอ ต่อให้แย่กว่า epoch ก่อนหน้า (บั๊กเดียวกับที่พบใน DRAEM)
+                #
+                # Snapshot the best-loss epoch's weights in RAM — previously
+                # early stopping only counted patience but never restored the
+                # actual best weights, so the epoch at which training stopped
+                # was always used, even if worse than an earlier epoch (same
+                # bug found in DRAEM).
+                best_state = {
+                    "ocbe":    {k: v.detach().cpu().clone()
+                                for k, v in self.ocbe.state_dict().items()},
+                    "student": {k: v.detach().cpu().clone()
+                                for k, v in self.student.state_dict().items()},
+                    "epoch": epoch, "loss": best_loss,
+                }
             else:
                 patience_ctr += 1
                 if patience_ctr >= self.cfg.PATIENCE:
                     logger.info(f"Early stop ที่ epoch {epoch+1}")
                     break
+
+        if best_state is not None:
+            self.ocbe.load_state_dict(best_state["ocbe"])
+            self.student.load_state_dict(best_state["student"])
+            logger.info(f"โหลดน้ำหนักที่ดีที่สุดกลับ (epoch {best_state['epoch']+1}, "
+                        f"loss={best_state['loss']:.4f}) ก่อนเข้า eval mode")
 
         self.ocbe.eval()
         self.student.eval()
@@ -224,10 +248,11 @@ class RD4AD:
         if self.ocbe is None:
             raise RuntimeError("RD4AD.score() ถูกเรียกก่อน fit()")
 
-        image_scores, labels, paths, pixel_maps = [], [], [], []
+        image_scores, y_true, labels, paths = [], [], [], []
+        pixel_maps, orig_imgs, preproc_imgs = [], [], []
 
         for batch in loader:
-            images, _orig, _preproc, batch_paths, batch_labels, _size = batch
+            images, orig, preproc, batch_paths, batch_labels, _size = batch
             images = images.to(self.device)
             B = images.shape[0]
 
@@ -247,15 +272,21 @@ class RD4AD:
                 pmap_np = _gaussian_smooth(combined[i, 0].cpu().numpy(), self.cfg.HEATMAP_SIGMA)
                 pixel_maps.append(pmap_np)
                 image_scores.append(float(pmap_np.max()))
+                orig_imgs.append(orig[i].permute(1, 2, 0).cpu().numpy().astype('float32'))
+                preproc_imgs.append(preproc[i].permute(1, 2, 0).cpu().numpy().astype('float32'))
 
-            labels.extend([0 if lb == "normal" else 1 for lb in batch_labels])
+            y_true.extend([0 if lb == "normal" else 1 for lb in batch_labels])
+            labels.extend(list(batch_labels))
             paths.extend(batch_paths)
 
         return ScoreResult(
             image_scores=np.array(image_scores, dtype=np.float64),
-            labels=np.array(labels, dtype=np.int64),
+            y_true=np.array(y_true, dtype=np.int64),
+            labels=labels,
             paths=paths,
             pixel_maps=np.stack(pixel_maps, axis=0),
+            orig_imgs=np.stack(orig_imgs, axis=0),
+            preproc_imgs=np.stack(preproc_imgs, axis=0),
         )
 
 
